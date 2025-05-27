@@ -1,8 +1,8 @@
 // Neculau Sanda-Elena 334CB
 
-#include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DFRobotDFPlayerMini.h>
+#include <Stream.h> // pentru dfplayer
 
 // initializare lcd si dfplayer
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -26,6 +26,145 @@ bool waitingForDecision = false;
 // volumul initial al difuzorului
 int volum = 10;
 
+//---------------- Implementare manuala pentru comunicarea seriala Serial0 - USB(debuging) --------------
+void manualSerialInit(long baud) {
+  // Setare registri pentru UART0 (Serial)
+  // calculare viteza de comunicare, F_CPU(viteza procesorului)
+  uint16_t ubrr = F_CPU/16/baud-1;
+  // impartim valoare pe 2 registri primi 8 biti si restul
+  UBRR0H = (unsigned char)(ubrr>>8);
+  UBRR0L = (unsigned char)ubrr;
+  // Activeaza receptorul (RXEN0) si transmisorul (TXEN0) pentru UART0
+  UCSR0B = (1<<RXEN0)|(1<<TXEN0);
+  // seteaza marimea datelor transmise la 8 biti 
+  UCSR0C = (1<<UCSZ01)|(1<<UCSZ00);
+}
+
+void manualSerialWrite(unsigned char data) {
+  // Asteaptam ca buffer-ul UDRE0 de transmisie sa se goleasca
+  // verifica daca bitul UDRE0 e activ
+  while (!(UCSR0A & (1<<UDRE0)));
+  // Scrie un caracter in registrul de date pentru al transmite
+  UDR0 = data;
+}
+
+// trimite caracter cu caracter pana ajunge la final
+void manualSerialPrint(const char* str) {
+  while (*str) {
+    manualSerialWrite(*str++);
+  }
+}
+
+// transforma numar intreg in caracter ascii si il transmite caracter cu caracter
+void manualSerialPrintNumber(int num) {
+  if (num == 0) {
+    manualSerialWrite('0');
+    return;
+  }
+  
+  char buffer[10];
+  int i = 0;
+  bool negative = false;
+  
+  if (num < 0) {
+    negative = true;
+    num = -num;
+  }
+  
+  while (num > 0) {
+    // se calculeaza valoarea numarului in caracter ascii
+    buffer[i++] = '0' + (num % 10);
+    num /= 10;
+  }
+  
+  // daca e negativ adaugam un - in fata
+  if (negative) {
+    manualSerialWrite('-');
+  }
+  
+  // Afiseaza cifrele in ordine inversa
+  for (int j = i - 1; j >= 0; j--) {
+    manualSerialWrite(buffer[j]);
+  }
+}
+
+void manualSerialPrintln(const char* str) {
+  manualSerialPrint(str);
+  manualSerialWrite('\r');
+  manualSerialWrite('\n');
+}
+
+// ------------------ Implementare manuala pentru comunicarea seriala Serial1 (DFPlayer) --------------
+void manualSerial1Init(long baud) {
+  // Setare registri pentru UART1 (Serial1)
+  // calculare viteza de comunicare, F_CPU(viteza procesorului)
+  uint16_t ubrr = F_CPU/16/baud-1;
+  // impartim pe 2 registri valoarea
+  UBRR1H = (unsigned char)(ubrr>>8);
+  UBRR1L = (unsigned char)ubrr;
+  // Activeaza receptorul (RXEN1) si transmisorul (TXEN1) pentru UART0
+  UCSR1B = (1<<RXEN1)|(1<<TXEN1);
+  // setez marimea datelor la 8 biti
+  UCSR1C = (1<<UCSZ11)|(1<<UCSZ10);
+}
+
+void manualSerial1Write(unsigned char data) {
+  // Asteapta buffer-ul de transmisie UDRE1 sa se goleasca
+  while (!(UCSR1A & (1<<UDRE1)));
+  // scrie caracterul in registru pentru transmisie pe UART1
+  UDR1 = data;
+}
+
+unsigned char manualSerial1Read() {
+  // Asteapta sa se primeasca date pe uart1 apoi il citeste, RXC1 = activ => date disponibile
+  while (!(UCSR1A & (1<<RXC1)));
+  return UDR1;
+}
+
+
+bool manualSerial1Available() {
+  // Verifica daca exista date primite in buffer-ul UART1
+  return (UCSR1A & (1<<RXC1));
+}
+
+// Clasa pentru Serial1 in DFPlayer care extinde stream
+class ManualSerial : public Stream {
+public:
+  // porneste comunicare cu viteza dorita
+  void begin(long baud) {
+    manualSerial1Init(baud);
+  }
+
+  // functie pentru a transmite datele byte cu byte
+  virtual size_t write(uint8_t data) override {
+    manualSerial1Write(data);
+    return 1;
+  }
+
+  // citeste caracterele daca e disponibil
+  virtual int read() override {
+    if (manualSerial1Available()) {
+      return manualSerial1Read();
+    }
+    return -1;
+  }
+
+  // verifica daca exista date disponibile pentru citire
+  virtual int available() override {
+    return manualSerial1Available() ? 1 : 0;
+  }
+
+  virtual int peek() override {
+    // Nu avem buffer pentru peek returnam -1
+    return -1;
+  }
+
+  using Print::write;  // permite folosirea altor supraincarcari din Print
+};
+
+// initializare serial1
+ManualSerial manualSerial1;
+
 void setup() {
   // setare pini rgb pentru iesire
   int pins[] = {led1R, led1G, led1B, led2R, led2G, led2B};
@@ -38,15 +177,16 @@ void setup() {
   // de la LOW la HIGH (adica o atingere pe senzor).
   attachInterrupt(digitalPinToInterrupt(touchPin), schimbareMod, RISING);
 
-  // initializare comunicati seriale
-  Serial.begin(9600);
-  Serial1.begin(9600); //dfplayer
+  // initializare comunicatii seriale manual
+  manualSerialInit(9600);
+  manualSerial1.begin(9600); //dfplayer manual
+  
   // pornire lcd
   lcd.begin();
   lcd.backlight();
 
-  if (!player.begin(Serial1)) {
-    Serial.println("DFPlayer nu a fost gasit!");
+  if (!player.begin(manualSerial1)) {
+    manualSerialPrintln("DFPlayer nu a fost gasit!");
     while (true);
   }
 
@@ -64,7 +204,7 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Detectie atingeri SENZOR
+  // Detectie atingeri SENZOR detectie atingere in 0,2 secunde
   if (touchDetected && currentMillis - lastTouchTime > 200) {
     touchDetected = false;
     lastTouchTime = currentMillis;
@@ -86,22 +226,31 @@ void loop() {
     if (touchCount == 1) {
       mode++;
       if (mode > 6) mode = 1;
-      Serial.print("Mod schimbat la: "); Serial.println(mode);
+      manualSerialPrint("Mod schimbat la: ");
+      manualSerialPrintNumber(mode);
+      manualSerialWrite('\r');
+      manualSerialWrite('\n');
       player.play(mode);
       afiseazaMod();
     } else if (touchCount == 2) {
       volum = min(volum + 2, 26);
       player.volume(volum);
-      Serial.print("Volum marit: "); Serial.println(volum);
+      manualSerialPrint("Volum marit: ");
+      manualSerialPrintNumber(volum);
+      manualSerialWrite('\r');
+      manualSerialWrite('\n');
       afiseazaVolum();
     } else if (touchCount >= 3) {
       volum = max(volum - 2, 0);
       player.volume(volum);
-      Serial.print("Volum scazut: "); Serial.println(volum);
+      manualSerialPrint("Volum scazut: ");
+      manualSerialPrintNumber(volum);
+      manualSerialWrite('\r');
+      manualSerialWrite('\n');
       afiseazaVolum();
     }
 
-    // Resetam numarul de apasari si daca s-a facut actiunea
+    // Resetam numarul de apasari si modificam flagul de actiune
     touchCount = 0;
     waitingForDecision = false;
   }
@@ -109,7 +258,7 @@ void loop() {
   // Daca piesa s-a terminat, o reluam
   if (player.available()) {
     if (player.readType() == DFPlayerPlayFinished) {
-      Serial.println("Piesa terminata. Reluam...");
+      manualSerialPrintln("Piesa terminata. Reluam...");
       player.play(mode);
     }
   }
@@ -154,8 +303,10 @@ void staticColors() {
 
     // citire analog fotorezistor A0 si aifsare valoare ambientala
     int lumina = analogRead(ldrPin);
-    Serial.print("Luminozitate ");
-    Serial.println(lumina);
+    manualSerialPrint("Luminozitate ");
+    manualSerialPrintNumber(lumina);
+    manualSerialWrite('\r');
+    manualSerialWrite('\n');
     delay(500);
 
     if (lumina < 250) {
